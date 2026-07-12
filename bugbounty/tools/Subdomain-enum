@@ -1,0 +1,403 @@
+package main
+
+import (
+	"bufio"
+	"flag"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+
+type Config struct {
+	Domain      string
+	DomainFile  string
+	Wordlist    string
+	Resolvers   string
+	GithubToken string
+	ShodanKey   string
+	OutputDir   string
+}
+
+// ─── Colors ───────────────────────────────────────────────────────────────────
+
+const (
+	RED    = "\033[31m"
+	GREEN  = "\033[32m"
+	YELLOW = "\033[33m"
+	BLUE   = "\033[34m"
+	CYAN   = "\033[36m"
+	RESET  = "\033[0m"
+	BOLD   = "\033[1m"
+)
+
+func info(msg string) {
+	fmt.Printf("%s[*]%s %s\n", CYAN, RESET, msg)
+}
+
+func success(msg string) {
+	fmt.Printf("%s[+]%s %s\n", GREEN, RESET, msg)
+}
+
+func warn(msg string) {
+	fmt.Printf("%s[!]%s %s\n", YELLOW, RESET, msg)
+}
+
+func banner() {
+	fmt.Printf(`%s
+╔═══════════════════════════════════════╗
+║      Subdomain Enumeration Tool       ║
+║           by your script              ║
+╚═══════════════════════════════════════╝
+%s`, CYAN, RESET)
+}
+
+// ─── Run Command ──────────────────────────────────────────────────────────────
+
+func runCommand(name string, args ...string) (string, error) {
+	cmd := exec.Command(name, args...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+func runCommandToFile(outputFile string, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	out, _ := cmd.CombinedOutput()
+
+	f, err := os.OpenFile(outputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			f.WriteString(line + "\n")
+		}
+	}
+	return nil
+}
+
+// ─── Load Domains ─────────────────────────────────────────────────────────────
+
+func loadDomains(cfg Config) []string {
+	var domains []string
+
+	if cfg.Domain != "" {
+		domains = append(domains, cfg.Domain)
+	}
+
+	if cfg.DomainFile != "" {
+		f, err := os.Open(cfg.DomainFile)
+		if err != nil {
+			warn("Could not open domain file: " + err.Error())
+			return domains
+		}
+		defer f.Close()
+
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line != "" {
+				domains = append(domains, line)
+			}
+		}
+	}
+
+	return domains
+}
+
+// ─── Enumerate One Domain ─────────────────────────────────────────────────────
+
+func enumerateDomain(domain string, cfg Config, rawFile string, mu *sync.Mutex) {
+	tmpFile := fmt.Sprintf("/tmp/subs_%s_%d.txt", domain, time.Now().UnixNano())
+
+	info(fmt.Sprintf("Starting enumeration for: %s%s%s", BOLD, domain, RESET))
+
+	// 1 — Subfinder
+	info("Running subfinder...")
+	if cfg.DomainFile != "" {
+		runCommandToFile(tmpFile, "subfinder", "-dL", cfg.DomainFile, "-all", "--recursive", "-silent")
+	} else {
+		runCommandToFile(tmpFile, "subfinder", "-d", domain, "-all", "--recursive", "-silent")
+	}
+
+	// 2 — Assetfinder
+	info("Running assetfinder...")
+	cmd := exec.Command("assetfinder", "--subs-only", domain)
+	out, _ := cmd.Output()
+	appendToFile(tmpFile, string(out))
+
+	// 3 — Subenum
+	info("Running subenum...")
+	runCommandToFile(tmpFile, "subenum", "-d", domain,
+		"-u", "wayback,crt,abuseipdb,Findomain,Subfinder,Amass,Assetfinder")
+
+	// 4 — Puredns bruteforce
+	if cfg.Wordlist != "" && cfg.Resolvers != "" {
+		info("Running puredns bruteforce...")
+		runCommandToFile(tmpFile, "puredns", "bruteforce",
+			cfg.Wordlist, domain, "-r", cfg.Resolvers)
+	} else {
+		warn("Skipping puredns — wordlist or resolvers not specified")
+	}
+
+	// 5 — GitHub subdomains
+	if cfg.GithubToken != "" {
+		info("Running github-subdomains...")
+		runCommandToFile(tmpFile, "github-subdomains",
+			"-d", domain, "-t", cfg.GithubToken)
+	} else {
+		warn("Skipping github-subdomains — no token provided")
+	}
+
+	// 6 — Shosubgo
+	if cfg.ShodanKey != "" {
+		info("Running shosubgo...")
+		runCommandToFile(tmpFile, "shosubgo",
+			"-d", domain, "-s", cfg.ShodanKey)
+	} else {
+		warn("Skipping shosubgo — no Shodan key provided")
+	}
+
+	// Merge into raw file
+	mu.Lock()
+	mergeFiles(tmpFile, rawFile)
+	mu.Unlock()
+
+	os.Remove(tmpFile)
+	success(fmt.Sprintf("Finished enumeration for: %s", domain))
+}
+
+// ─── File Helpers ─────────────────────────────────────────────────────────────
+
+func appendToFile(filePath, content string) {
+	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			f.WriteString(line + "\n")
+		}
+	}
+}
+
+func mergeFiles(src, dst string) {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return
+	}
+	appendToFile(dst, string(data))
+}
+
+// ─── Remove Duplicates ────────────────────────────────────────────────────────
+
+func removeDuplicates(inputFile, outputFile string) int {
+	f, err := os.Open(inputFile)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	seen := make(map[string]bool)
+	var unique []string
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.ToLower(strings.TrimSpace(scanner.Text()))
+		if line != "" && !seen[line] {
+			seen[line] = true
+			unique = append(unique, line)
+		}
+	}
+
+	out, err := os.Create(outputFile)
+	if err != nil {
+		return 0
+	}
+	defer out.Close()
+
+	for _, line := range unique {
+		out.WriteString(line + "\n")
+	}
+
+	return len(unique)
+}
+
+// ─── HTTPX Probing ────────────────────────────────────────────────────────────
+
+func probeHTTPX(allSubsFile, outputDir string) {
+	info("Probing live subdomains with httpx...")
+
+	allLive := outputDir + "/all-live-subs.txt"
+	live200  := outputDir + "/200-live-subs.txt"
+	live403  := outputDir + "/403-live-subs.txt"
+	aliveRaw := outputDir + "/AliveSubs.txt"
+
+	// All alive (just URLs)
+	info("Running httpx for all alive subdomains...")
+	runCommandToFile(aliveRaw, "httpx",
+		"-l", allSubsFile,
+		"-silent")
+
+	// All live with details
+	info("Running httpx with full details...")
+	runCommandToFile(allLive, "httpx",
+		"-l", allSubsFile,
+		"-status-code",
+		"-content-length",
+		"-web-server",
+		"-title",
+		"-follow-redirects",
+		"-silent")
+
+	// 200 only
+	info("Running httpx for 200 status codes...")
+	runCommandToFile(live200, "httpx",
+		"-l", allSubsFile,
+		"-status-code",
+		"-content-length",
+		"-web-server",
+		"-title",
+		"-follow-redirects",
+		"-match-code", "200",
+		"-silent")
+
+	// 403 only
+	info("Running httpx for 403 status codes...")
+	runCommandToFile(live403, "httpx",
+		"-l", allSubsFile,
+		"-status-code",
+		"-content-length",
+		"-web-server",
+		"-title",
+		"-follow-redirects",
+		"-match-code", "403",
+		"-silent")
+
+	success("HTTPX probing complete!")
+}
+
+// ─── Print Summary ────────────────────────────────────────────────────────────
+
+func printSummary(outputDir string) {
+	files := map[string]string{
+		"All Subdomains":    outputDir + "/AllSubs.txt",
+		"All Live":          outputDir + "/all-live-subs.txt",
+		"200 Live":          outputDir + "/200-live-subs.txt",
+		"403 Live":          outputDir + "/403-live-subs.txt",
+		"Alive (URLs only)": outputDir + "/AliveSubs.txt",
+	}
+
+	fmt.Printf("\n%s%s═══════════════ SUMMARY ═══════════════%s\n", BOLD, GREEN, RESET)
+	for name, path := range files {
+		count := countLines(path)
+		fmt.Printf("%s[+]%s %-20s → %s%d subdomains%s (%s)\n",
+			GREEN, RESET, name, BOLD, count, RESET, path)
+	}
+	fmt.Printf("%s%s═══════════════════════════════════════%s\n\n", BOLD, GREEN, RESET)
+}
+
+func countLines(filePath string) int {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	count := 0
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		if strings.TrimSpace(scanner.Text()) != "" {
+			count++
+		}
+	}
+	return count
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
+func main() {
+	banner()
+
+	// Flags
+	domain      := flag.String("d", "", "Single domain to enumerate")
+	domainFile  := flag.String("dL", "", "File containing list of domains")
+	wordlist    := flag.String("w", "", "Path to wordlist for puredns bruteforce")
+	resolvers   := flag.String("r", "", "Path to resolvers file for puredns")
+	githubToken := flag.String("gt", "", "GitHub Personal Access Token")
+	shodanKey   := flag.String("sk", "", "Shodan API key")
+	outputDir   := flag.String("o", "output", "Output directory")
+	flag.Parse()
+
+	// Validate input
+	if *domain == "" && *domainFile == "" {
+		fmt.Printf("%s[ERROR]%s Please provide a domain (-d) or domain file (-dL)\n", RED, RESET)
+		fmt.Println("\nUsage:")
+		fmt.Println("  ./subdomain-enum -d example.com -w wordlist.txt -r resolvers.txt -gt TOKEN -sk SHODAN_KEY")
+		fmt.Println("  ./subdomain-enum -dL domains.txt -w wordlist.txt -r resolvers.txt")
+		os.Exit(1)
+	}
+
+	// Create output directory
+	os.MkdirAll(*outputDir, 0755)
+
+	cfg := Config{
+		Domain:      *domain,
+		DomainFile:  *domainFile,
+		Wordlist:    *wordlist,
+		Resolvers:   *resolvers,
+		GithubToken: *githubToken,
+		ShodanKey:   *shodanKey,
+		OutputDir:   *outputDir,
+	}
+
+	// Load domains
+	domains := loadDomains(cfg)
+	if len(domains) == 0 {
+		fmt.Printf("%s[ERROR]%s No domains found\n", RED, RESET)
+		os.Exit(1)
+	}
+
+	info(fmt.Sprintf("Loaded %d domain(s)", len(domains)))
+
+	// Raw output file (before dedup)
+	rawFile := *outputDir + "/raw_subs.txt"
+	allSubs := *outputDir + "/AllSubs.txt"
+
+	// Enumerate all domains concurrently
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for _, domain := range domains {
+		wg.Add(1)
+		go func(d string) {
+			defer wg.Done()
+			enumerateDomain(d, cfg, rawFile, &mu)
+		}(domain)
+	}
+
+	wg.Wait()
+
+	// Remove duplicates
+	info("Removing duplicates...")
+	count := removeDuplicates(rawFile, allSubs)
+	success(fmt.Sprintf("Total unique subdomains: %d → saved to %s", count, allSubs))
+
+	// HTTPX probing
+	probeHTTPX(allSubs, *outputDir)
+
+	// Summary
+	printSummary(*outputDir)
+}
